@@ -1,0 +1,127 @@
+"""pilot_simple.py — Basic email assistant without human approval.
+
+Triage emails then respond automatically. Good for testing and demos.
+"""
+from typing import Literal
+
+from langchain.chat_models import init_chat_model
+
+from inboxpilot.tools import get_tools, get_tools_by_name
+from inboxpilot.tools.prompt_templates import AGENT_TOOLS_PROMPT
+from inboxpilot.prompts import (
+    triage_system_prompt, triage_user_prompt, agent_system_prompt,
+    get_background, default_triage_instructions,
+    default_response_preferences, default_cal_preferences,
+)
+from inboxpilot.schemas import State, RouterSchema, StateInput
+from inboxpilot.utils import parse_email, format_email_markdown
+
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Command
+from dotenv import load_dotenv
+load_dotenv(".env")
+
+tools = get_tools()
+tools_by_name = get_tools_by_name(tools)
+
+llm = init_chat_model("openai:gpt-4.1", temperature=0.0)
+llm_router = llm.with_structured_output(RouterSchema)
+
+llm = init_chat_model("openai:gpt-4.1", temperature=0.0)
+llm_with_tools = llm.bind_tools(tools, tool_choice="any")
+
+def llm_call(state: State):
+    """LLM decides which tool to call."""
+    return {
+        "messages": [
+            llm_with_tools.invoke(
+                [
+                    {"role": "system", "content": agent_system_prompt.format(
+                        tools_prompt=AGENT_TOOLS_PROMPT,
+                        background=get_background(),
+                        response_preferences=default_response_preferences,
+                        cal_preferences=default_cal_preferences)
+                    },
+                ]
+                + state["messages"]
+            )
+        ]
+    }
+
+def tool_node(state: State):
+    """Execute the tool called by the LLM."""
+    result = []
+    for tool_call in state["messages"][-1].tool_calls:
+        tool = tools_by_name[tool_call["name"]]
+        observation = tool.invoke(tool_call["args"])
+        result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
+    return {"messages": result}
+
+def should_continue(state: State) -> Literal["Action", "__end__"]:
+    """Route to tool execution or end when Done is called."""
+    messages = state["messages"]
+    last_message = messages[-1]
+    if last_message.tool_calls:
+        for tool_call in last_message.tool_calls:
+            if tool_call["name"] == "Done":
+                return END
+            else:
+                return "Action"
+
+agent_builder = StateGraph(State)
+agent_builder.add_node("llm_call", llm_call)
+agent_builder.add_node("environment", tool_node)
+agent_builder.add_edge(START, "llm_call")
+agent_builder.add_conditional_edges(
+    "llm_call",
+    should_continue,
+    {"Action": "environment", END: END},
+)
+agent_builder.add_edge("environment", "llm_call")
+agent = agent_builder.compile()
+
+def triage_router(state: State) -> Command[Literal["response_agent", "__end__"]]:
+    """Classify email as respond, notify, or ignore."""
+    author, to, subject, email_thread = parse_email(state["email_input"])
+    system_prompt = triage_system_prompt.format(
+        background=get_background(),
+        triage_instructions=default_triage_instructions
+    )
+    user_prompt = triage_user_prompt.format(
+        author=author, to=to, subject=subject, email_thread=email_thread
+    )
+    email_markdown = format_email_markdown(subject, author, to, email_thread)
+
+    result = llm_router.invoke([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ])
+    classification = result.classification
+
+    if classification == "respond":
+        print("📧 Classification: RESPOND")
+        goto = "response_agent"
+        update = {
+            "classification_decision": result.classification,
+            "messages": [{"role": "user", "content": f"Respond to the email: {email_markdown}"}],
+        }
+    elif classification == "ignore":
+        print("🚫 Classification: IGNORE")
+        update = {"classification_decision": result.classification}
+        goto = END
+    elif classification == "notify":
+        print("🔔 Classification: NOTIFY")
+        update = {"classification_decision": result.classification}
+        goto = END
+    else:
+        raise ValueError(f"Invalid classification: {result.classification}")
+    return Command(goto=goto, update=update)
+
+overall_workflow = (
+    StateGraph(State, input=StateInput)
+    .add_node(triage_router)
+    .add_node("response_agent", agent)
+    .add_edge(START, "triage_router")
+)
+
+email_assistant = overall_workflow.compile()

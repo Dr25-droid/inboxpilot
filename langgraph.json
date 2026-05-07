@@ -1,0 +1,15 @@
+{
+    "dockerfile_lines": [],
+    "graphs": {
+      "pilot":         "./src/inboxpilot/pilot.py:email_assistant",
+      "pilot_simple":  "./src/inboxpilot/pilot_simple.py:email_assistant",
+      "pilot_review":  "./src/inboxpilot/pilot_review.py:email_assistant",
+      "pilot_gmail":   "./src/inboxpilot/pilot_gmail.py:email_assistant",
+      "cron":          "./src/inboxpilot/cron.py:graph"
+    },
+    "python_version": "3.11",
+    "env": ".env",
+    "dependencies": [
+      "."
+    ]
+  }
